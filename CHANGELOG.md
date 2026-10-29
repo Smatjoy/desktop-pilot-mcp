@@ -4,6 +4,20 @@ All notable changes to WinApp MCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased] — fork `ec3-runner-fixes`
+
+Fixes found while driving a WinForms + DevExpress app (Ekip Connect 3) as an unattended test runner.
+
+### Fixed
+- **Minimized windows no longer give empty searches.** WinForms/DevExpress windows expose only their title bar to UIA while minimized, so every lookup returned "not found". Element searches now restore the window first (not when the session is locked); `check_session_status` no longer claims every operation works while minimized.
+- **No silent mis-clicks.** `click_element` scrolls an off-screen element into view (ScrollItemPattern) and refuses to click if it stays off-screen, instead of clicking whatever is at those coordinates and reporting success.
+- **ComboBox reads do not open the drop-down.** Selections are read through ValuePattern / SelectionPattern only (`read_element`, `read_element_by_index`, `get_all_values`, `wait_for_condition selectedItem`, snapshots).
+
+### Added
+- `WINAPP_NAME_MATCH=exact` environment variable: name filters match exactly (case-insensitive) instead of "equals or contains", so "Settings A" no longer matches "Other Settings A".
+- `container` (AutomationId of an ancestor) and `visibleOnly` (on-screen elements only) on `find_all_elements`, `click_element`, `read_element`, `element_exists`, `wait_for_element`, `get_element_bounds`, `get_grid_item` and (`container`) `scroll_into_view`; `index` on `read_element`.
+- `take_element_screenshot`: the window capture cropped to one element's bounds (works on multi-monitor setups with negative coordinates).
+
 ## [2.0.0] — 2026-03-28
 
 ### Changed — .NET 10 Migration
