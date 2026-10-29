@@ -45,6 +45,7 @@ public sealed class WinAppAutomation : IDisposable
             return cached;
         }
 
+        EnsureTreeAvailable(win);
         AutomationElement[] descendants = win.FindAllDescendants();
         _descendantCache[appId] = descendants;
         _descendantCacheTime[appId] = DateTime.UtcNow;
@@ -56,6 +57,90 @@ public sealed class WinAppAutomation : IDisposable
     {
         _descendantCache.Remove(appId);
         _descendantCacheTime.Remove(appId);
+    }
+
+    /// <summary>
+    /// Some frameworks (WinForms with DevExpress, among others) expose only the title bar to UIA while
+    /// the window is minimized, so every search silently finds nothing. Restore it before searching.
+    /// Not done when the session is locked (the restore cannot take effect there).
+    /// </summary>
+    private static void EnsureTreeAvailable(AutomationElement win)
+    {
+        IntPtr hwnd = GetNativeHandle(win);
+        if (hwnd != IntPtr.Zero && IsIconic(hwnd) && !IsDesktopLocked())
+            RestoreAndForeground(hwnd);
+    }
+
+    // ── Name matching and scoping ────────────────────────────────────
+
+    /// WINAPP_NAME_MATCH=exact makes every name filter an exact (case-insensitive) match instead of
+    /// "equals or contains". Test runners want this: "Settings A" must not match "Other Settings A".
+    private static readonly bool ExactNames =
+        string.Equals(Environment.GetEnvironmentVariable("WINAPP_NAME_MATCH"), "exact", StringComparison.OrdinalIgnoreCase);
+
+    private static bool NameMatches(string elName, string name) =>
+        elName.Equals(name, StringComparison.OrdinalIgnoreCase)
+        || (!ExactNames && elName.Contains(name, StringComparison.OrdinalIgnoreCase));
+
+    /// On screen: not offscreen and with a non-empty bounding rectangle. Distinguishes, e.g., the grid of the
+    /// visible tab from the grids of hidden tabs that share its AutomationId.
+    private static bool IsVisibleElement(AutomationElement el)
+    {
+        try
+        {
+            if (el.Properties.IsOffscreen.ValueOrDefault)
+                return false;
+            Rectangle r = el.BoundingRectangle;
+            return r.Width > 0 && r.Height > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Finds an element with optional scoping: 'container' is the AutomationId of an ancestor (the element must be
+    /// one of its descendants), 'visibleOnly' keeps only on-screen matches (containers too). Without either, and
+    /// without exact names, it behaves like the original FindElement / FindElementByIndex.
+    /// </summary>
+    private AutomationElement? ResolveElement(string appId, string? automationId, string? name, string? controlType,
+        int index = -1, string? container = null, bool visibleOnly = false)
+    {
+        if (string.IsNullOrEmpty(container) && !visibleOnly)
+            return index >= 0
+                ? FindElementByIndex(appId, automationId, name, controlType, index)
+                : FindElement(appId, automationId, name, controlType);
+
+        List<AutomationElement> matches = FindAllMatchingElements(appId, automationId, name, controlType, container, visibleOnly);
+        int i = index >= 0 ? index : 0;
+        if (i >= matches.Count)
+            return null;
+        _focusedElement = matches[i];
+        return matches[i];
+    }
+
+    /// Reads a ComboBox selection through ValuePattern / SelectionPattern only. FlaUI's ComboBox.SelectedItem can
+    /// expand the drop-down to find the selection, which leaves it open on WinForms/DevExpress editors.
+    private static string? ReadComboSelection(AutomationElement el)
+    {
+        try
+        {
+            if (el.Patterns.Value.TryGetPattern(out FlaUI.Core.Patterns.IValuePattern? vp) && !string.IsNullOrEmpty(vp.Value.Value))
+                return vp.Value.Value;
+        }
+        catch { }
+        try
+        {
+            if (el.Patterns.Selection.TryGetPattern(out FlaUI.Core.Patterns.ISelectionPattern? sp))
+            {
+                AutomationElement[] selected = sp.Selection.Value;
+                if (selected.Length > 0)
+                    return string.Join(", ", selected.Select(s => s.Properties.Name.ValueOrDefault ?? ""));
+            }
+        }
+        catch { }
+        return null;
     }
 
     public void Dispose()
@@ -357,9 +442,7 @@ public sealed class WinAppAutomation : IDisposable
                 }
                 else if (child.ControlType == ControlType.ComboBox)
                 {
-                    ComboBox? combo = child.AsComboBox();
-                    if (combo is not null)
-                        sb.Append($" Selected=\"{combo.SelectedItem?.Text}\"");
+                    sb.Append($" Selected=\"{ReadComboSelection(child)}\"");
                 }
             }
             catch { }
@@ -379,6 +462,7 @@ public sealed class WinAppAutomation : IDisposable
 
         try
         {
+            EnsureTreeAvailable(win);
             ConditionFactory cf = _automation.ConditionFactory;
             List<ConditionBase> conditions = new();
 
@@ -413,10 +497,7 @@ public sealed class WinAppAutomation : IDisposable
                     if (!string.IsNullOrEmpty(automationId))
                         match &= (el.Properties.AutomationId.ValueOrDefault ?? "") == automationId;
                     if (!string.IsNullOrEmpty(name))
-                    {
-                        string elName = el.Properties.Name.ValueOrDefault ?? "";
-                        match &= elName.Equals(name, StringComparison.OrdinalIgnoreCase) || elName.Contains(name, StringComparison.OrdinalIgnoreCase);
-                    }
+                        match &= NameMatches(el.Properties.Name.ValueOrDefault ?? "", name);
                     if (match)
                     {
                         _focusedElement = el;
@@ -436,7 +517,8 @@ public sealed class WinAppAutomation : IDisposable
 
     // ── Find All Elements (with index support) ─────────────────────
 
-    private List<AutomationElement> FindAllMatchingElements(string appId, string? automationId, string? name, string? controlType)
+    private List<AutomationElement> FindAllMatchingElements(string appId, string? automationId, string? name, string? controlType,
+        string? container = null, bool visibleOnly = false)
     {
         Window? win = GetMainWindow(appId);
         if (win is null)
@@ -446,6 +528,22 @@ public sealed class WinAppAutomation : IDisposable
         {
             List<AutomationElement> results = new();
             AutomationElement[] allElements = GetCachedDescendants(appId, win);
+            if (!string.IsNullOrEmpty(container))
+            {
+                // Search only below the matching containers (on-screen ones when visibleOnly)
+                List<AutomationElement> scoped = new();
+                foreach (AutomationElement c in allElements)
+                {
+                    try
+                    {
+                        if ((c.Properties.AutomationId.ValueOrDefault ?? "") != container || (visibleOnly && !IsVisibleElement(c)))
+                            continue;
+                        scoped.AddRange(c.FindAllDescendants());
+                    }
+                    catch { }
+                }
+                allElements = scoped.ToArray();
+            }
             foreach (AutomationElement el in allElements)
             {
                 try
@@ -454,12 +552,11 @@ public sealed class WinAppAutomation : IDisposable
                     if (!string.IsNullOrEmpty(automationId))
                         match &= (el.Properties.AutomationId.ValueOrDefault ?? "") == automationId;
                     if (!string.IsNullOrEmpty(name))
-                    {
-                        string elName = el.Properties.Name.ValueOrDefault ?? "";
-                        match &= elName.Equals(name, StringComparison.OrdinalIgnoreCase) || elName.Contains(name, StringComparison.OrdinalIgnoreCase);
-                    }
+                        match &= NameMatches(el.Properties.Name.ValueOrDefault ?? "", name);
                     if (!string.IsNullOrEmpty(controlType) && Enum.TryParse<ControlType>(controlType, true, out ControlType ct))
                         match &= el.Properties.ControlType.ValueOrDefault == ct;
+                    if (match && visibleOnly)
+                        match &= IsVisibleElement(el);
                     if (match)
                         results.Add(el);
                 }
@@ -482,9 +579,10 @@ public sealed class WinAppAutomation : IDisposable
         return matches[index];
     }
 
-    public string FindAllElements(string appId, string? automationId = null, string? name = null, string? controlType = null)
+    public string FindAllElements(string appId, string? automationId = null, string? name = null, string? controlType = null,
+        string? container = null, bool visibleOnly = false)
     {
-        List<AutomationElement> matches = FindAllMatchingElements(appId, automationId, name, controlType);
+        List<AutomationElement> matches = FindAllMatchingElements(appId, automationId, name, controlType, container, visibleOnly);
         if (matches.Count == 0)
             return "No matching elements found.";
 
@@ -513,13 +611,32 @@ public sealed class WinAppAutomation : IDisposable
 
     // ── Click ────────────────────────────────────────────────────────
 
-    public string ClickElement(string appId, string? automationId = null, string? name = null, string? controlType = null, int index = -1)
+    public string ClickElement(string appId, string? automationId = null, string? name = null, string? controlType = null, int index = -1,
+        string? container = null, bool visibleOnly = false)
     {
-        AutomationElement? el = index >= 0
-            ? FindElementByIndex(appId, automationId, name, controlType, index)
-            : FindElement(appId, automationId, name, controlType);
+        AutomationElement? el = ResolveElement(appId, automationId, name, controlType, index, container, visibleOnly);
         if (el is null)
-            return $"ERROR: Element not found (automationId={automationId}, name={name}, controlType={controlType}, index={index})";
+            return $"ERROR: Element not found (automationId={automationId}, name={name}, controlType={controlType}, index={index}, container={container}, visibleOnly={visibleOnly})";
+
+        // A mouse click on an element outside the visible area lands on whatever is there instead (or on
+        // nothing) and still reports success. Scroll it into view first; refuse to click if that fails.
+        if (!IsVisibleElement(el))
+        {
+            try
+            {
+                if (el.Patterns.ScrollItem.TryGetPattern(out FlaUI.Core.Patterns.IScrollItemPattern? scrollItem))
+                {
+                    scrollItem.ScrollIntoView();
+                    Thread.Sleep(150);
+                }
+            }
+            catch { }
+            if (!IsVisibleElement(el))
+            {
+                try { return $"ERROR: [{el.ControlType}] \"{el.Name}\" is off-screen and could not be scrolled into view; not clicked. Use scroll_into_view or scroll its container first."; }
+                catch { return "ERROR: Element is off-screen; not clicked."; }
+            }
+        }
 
         // When window is minimized or session is locked, try UIA patterns first
         Window? win = GetMainWindow(appId);
@@ -810,9 +927,10 @@ public sealed class WinAppAutomation : IDisposable
 
     // ── Read ─────────────────────────────────────────────────────────
 
-    public string ReadElement(string appId, string? automationId = null, string? name = null, string? controlType = null)
+    public string ReadElement(string appId, string? automationId = null, string? name = null, string? controlType = null,
+        int index = -1, string? container = null, bool visibleOnly = false)
     {
-        AutomationElement? el = FindElement(appId, automationId, name, controlType);
+        AutomationElement? el = ResolveElement(appId, automationId, name, controlType, index, container, visibleOnly);
         if (el is null)
             return $"ERROR: Element not found";
 
@@ -841,9 +959,7 @@ public sealed class WinAppAutomation : IDisposable
             }
             else if (el.ControlType == ControlType.ComboBox)
             {
-                ComboBox? combo = el.AsComboBox();
-                if (combo is not null)
-                    sb.AppendLine($"SelectedItem: {combo.SelectedItem?.Text}");
+                sb.AppendLine($"SelectedItem: {ReadComboSelection(el)}");
             }
             else if (el.ControlType == ControlType.DataGrid || el.ControlType == ControlType.Table)
             {
@@ -953,14 +1069,58 @@ public sealed class WinAppAutomation : IDisposable
         }
     }
 
+    /// Screenshot of one element: the window capture cropped to the element's bounds (plus a margin), so a
+    /// model looking at it sees the widget and not the whole page.
+    public string TakeElementScreenshot(string appId, string outputPath, string? automationId = null, string? name = null, string? controlType = null,
+        int index = -1, string? container = null, bool visibleOnly = false, int margin = 4)
+    {
+        Window? win = GetMainWindow(appId);
+        if (win is null)
+            return $"ERROR: Cannot get main window for '{appId}'";
+        AutomationElement? el = ResolveElement(appId, automationId, name, controlType, index, container, visibleOnly);
+        if (el is null)
+            return $"ERROR: Element not found (automationId={automationId}, name={name}, container={container})";
+
+        try
+        {
+            Rectangle elRect = el.BoundingRectangle;
+            Rectangle winRect = win.BoundingRectangle;
+            if (elRect.Width <= 0 || elRect.Height <= 0)
+                return "ERROR: Element has empty bounds (off-screen or hidden)";
+
+            using Bitmap? bmp = CaptureWindowBitmap(win);
+            if (bmp is null)
+                return "ERROR: Failed to capture window.";
+
+            Rectangle crop = new(elRect.X - winRect.X - margin, elRect.Y - winRect.Y - margin, elRect.Width + 2 * margin, elRect.Height + 2 * margin);
+            crop.Intersect(new Rectangle(0, 0, bmp.Width, bmp.Height));
+            if (crop.Width <= 0 || crop.Height <= 0)
+                return "ERROR: Element is outside the window capture";
+
+            using Bitmap part = bmp.Clone(crop, bmp.PixelFormat);
+            string? dir = Path.GetDirectoryName(outputPath);
+            if (!string.IsNullOrEmpty(dir))
+                Directory.CreateDirectory(dir);
+            part.Save(outputPath, ImageFormat.Png);
+            return $"Element screenshot saved to {outputPath} ({part.Width}x{part.Height})";
+        }
+        catch (Exception ex)
+        {
+            return $"ERROR: {ex.Message}";
+        }
+    }
+
     // ── Wait ─────────────────────────────────────────────────────────
 
-    public string WaitForElement(string appId, string? automationId, string? name, string? controlType, int timeoutMs = 10000)
+    public string WaitForElement(string appId, string? automationId, string? name, string? controlType, int timeoutMs = 10000,
+        string? container = null, bool visibleOnly = false)
     {
         DateTime deadline = DateTime.Now.AddMilliseconds(timeoutMs);
         while (DateTime.Now < deadline)
         {
-            AutomationElement? el = FindElement(appId, automationId, name, controlType);
+            if (!string.IsNullOrEmpty(container) || visibleOnly)
+                InvalidateDescendantCache(appId);
+            AutomationElement? el = ResolveElement(appId, automationId, name, controlType, -1, container, visibleOnly);
             if (el is not null)
                 return $"Found [{el.ControlType}] \"{el.Name}\" (AutomationId={el.AutomationId})";
             Thread.Sleep(300);
@@ -1196,9 +1356,7 @@ public sealed class WinAppAutomation : IDisposable
             }
             else if (el.ControlType == ControlType.ComboBox)
             {
-                ComboBox? combo = el.AsComboBox();
-                if (combo is not null)
-                    sb.AppendLine($"SelectedItem: {combo.SelectedItem?.Text}");
+                sb.AppendLine($"SelectedItem: {ReadComboSelection(el)}");
             }
             else if (el.ControlType == ControlType.DataGrid || el.ControlType == ControlType.Table)
             {
@@ -1217,11 +1375,10 @@ public sealed class WinAppAutomation : IDisposable
 
     // ── Get Element Bounds ───────────────────────────────────────────
 
-    public string GetElementBounds(string appId, string? automationId, string? name, string? controlType, int index = -1)
+    public string GetElementBounds(string appId, string? automationId, string? name, string? controlType, int index = -1,
+        string? container = null, bool visibleOnly = false)
     {
-        AutomationElement? el = index >= 0
-            ? FindElementByIndex(appId, automationId, name, controlType, index)
-            : FindElement(appId, automationId, name, controlType);
+        AutomationElement? el = ResolveElement(appId, automationId, name, controlType, index, container, visibleOnly);
         if (el is null)
             return $"ERROR: Element not found";
 
@@ -1238,9 +1395,10 @@ public sealed class WinAppAutomation : IDisposable
 
     // ── Element Exists ───────────────────────────────────────────────
 
-    public string ElementExists(string appId, string? automationId, string? name, string? controlType)
+    public string ElementExists(string appId, string? automationId, string? name, string? controlType,
+        string? container = null, bool visibleOnly = false)
     {
-        AutomationElement? el = FindElement(appId, automationId, name, controlType);
+        AutomationElement? el = ResolveElement(appId, automationId, name, controlType, -1, container, visibleOnly);
         if (el is null)
             return "false";
 
@@ -1273,7 +1431,7 @@ public sealed class WinAppAutomation : IDisposable
                         "isoffscreen" => el.Properties.IsOffscreen.ValueOrDefault.ToString(),
                         "text" or "value" => GetElementTextValue(el),
                         "ischecked" => el.AsCheckBox()?.IsChecked?.ToString(),
-                        "selecteditem" => el.AsComboBox()?.SelectedItem?.Text,
+                        "selecteditem" => ReadComboSelection(el),
                         "automationid" => el.Properties.AutomationId.ValueOrDefault,
                         _ => null
                     };
@@ -1453,8 +1611,7 @@ public sealed class WinAppAutomation : IDisposable
                     }
                     else if (ct == ControlType.ComboBox)
                     {
-                        ComboBox? combo = el.AsComboBox();
-                        value = combo?.SelectedItem?.Text ?? "";
+                        value = ReadComboSelection(el) ?? "";
                     }
                     else if (ct == ControlType.CheckBox)
                     {
@@ -2021,13 +2178,14 @@ public sealed class WinAppAutomation : IDisposable
     // ── ScrollItemPattern — Scroll element into view ─────────────────
     // ══════════════════════════════════════════════════════════════════
 
-    public string ScrollIntoView(string appId, string? automationId, string? name, string? controlType, int index = -1, long windowHandle = 0)
+    public string ScrollIntoView(string appId, string? automationId, string? name, string? controlType, int index = -1, long windowHandle = 0,
+        string? container = null)
     {
         AutomationElement? el;
         if (windowHandle != 0)
             el = FindElementInHwnd(windowHandle, automationId, name, controlType);
         else
-            el = index >= 0 ? FindElementByIndex(appId, automationId, name, controlType, index) : FindElement(appId, automationId, name, controlType);
+            el = ResolveElement(appId, automationId, name, controlType, index, container);
 
         if (el is null)
             return $"ERROR: Element not found (automationId={automationId}, name={name})";
@@ -2361,13 +2519,14 @@ public sealed class WinAppAutomation : IDisposable
     // ── GridPattern — Direct grid cell access ────────────────────────
     // ══════════════════════════════════════════════════════════════════
 
-    public string GetGridItem(string appId, int row, int column, string? automationId = null, string? name = null, string? controlType = null, int index = -1, long windowHandle = 0)
+    public string GetGridItem(string appId, int row, int column, string? automationId = null, string? name = null, string? controlType = null, int index = -1, long windowHandle = 0,
+        string? container = null, bool visibleOnly = false)
     {
         AutomationElement? el;
         if (windowHandle != 0)
             el = FindElementInHwnd(windowHandle, automationId, name, controlType ?? "DataGrid");
         else
-            el = index >= 0 ? FindElementByIndex(appId, automationId, name, controlType ?? "DataGrid", index) : FindElement(appId, automationId, name, controlType ?? "DataGrid");
+            el = ResolveElement(appId, automationId, name, controlType ?? "DataGrid", index, container, visibleOnly);
 
         if (el is null)
             return $"ERROR: Grid element not found (automationId={automationId}, name={name})";
@@ -2964,8 +3123,8 @@ public sealed class WinAppAutomation : IDisposable
 
             if (isMinimized && !isLocked)
             {
-                sb.AppendLine("Impact: Mouse/keyboard operations will auto-restore the window. Screenshots use PrintWindow API.");
-                sb.AppendLine("Recommendation: All operations work automatically. Use restore_window to bring window up manually.");
+                sb.AppendLine("Impact: Some frameworks (e.g. WinForms/DevExpress) expose only the title bar to UIA while minimized. Element searches and mouse/keyboard operations restore the window automatically; screenshots use PrintWindow API.");
+                sb.AppendLine("Recommendation: Use restore_window before a series of reads, so the tree is complete.");
             }
             else if (isMinimized && isLocked)
             {

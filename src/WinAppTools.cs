@@ -87,9 +87,12 @@ public sealed class WinAppTools
         [Description("App ID")] string appId,
         [Description("AutomationId of the element")] string? automationId = null,
         [Description("Name/text of the element")] string? name = null,
-        [Description("Control type filter: Button, Edit, Text, CheckBox, ComboBox, ListItem, DataGrid, etc.")] string? controlType = null)
+        [Description("Control type filter: Button, Edit, Text, CheckBox, ComboBox, ListItem, DataGrid, etc.")] string? controlType = null,
+        [Description("0-based index when multiple elements match (-1 = first match)")] int index = -1,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.ReadElement(appId, automationId, name, controlType);
+        return _auto.ReadElement(appId, automationId, name, controlType, index, container, visibleOnly);
     }
 
     // ── Click Actions ────────────────────────────────────────────────
@@ -99,20 +102,24 @@ public sealed class WinAppTools
         [Description("App ID")] string appId,
         [Description("AutomationId to search for")] string? automationId = null,
         [Description("Name/text to search for")] string? name = null,
-        [Description("Control type filter (e.g. 'Button', 'Edit')")] string? controlType = null)
+        [Description("Control type filter (e.g. 'Button', 'Edit')")] string? controlType = null,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.FindAllElements(appId, automationId, name, controlType);
+        return _auto.FindAllElements(appId, automationId, name, controlType, container, visibleOnly);
     }
 
-    [McpServerTool, Description("Click a UI element. Provide at least one of automationId or name to find the element. Use 'index' when multiple elements match (use find_all_elements to discover indices).")]
+    [McpServerTool, Description("Click a UI element. Provide at least one of automationId or name to find the element. Use 'index' when multiple elements match (use find_all_elements to discover indices), or narrow with container / visibleOnly. An off-screen element is scrolled into view first; if it stays off-screen the click is refused with an error.")]
     public static string click_element(
         [Description("App ID")] string appId,
         [Description("AutomationId of the element")] string? automationId = null,
         [Description("Name/text of the element")] string? name = null,
         [Description("Control type filter (e.g. 'Button', 'ListItem')")] string? controlType = null,
-        [Description("0-based index when multiple elements match. Use find_all_elements to see available indices. -1 means first match (default).")] int index = -1)
+        [Description("0-based index when multiple elements match. Use find_all_elements to see available indices. -1 means first match (default).")] int index = -1,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.ClickElement(appId, automationId, name, controlType, index);
+        return _auto.ClickElement(appId, automationId, name, controlType, index, container, visibleOnly);
     }
 
     [McpServerTool, Description("Double-click a UI element.")]
@@ -222,9 +229,11 @@ public sealed class WinAppTools
         [Description("AutomationId to wait for")] string? automationId = null,
         [Description("Name to wait for")] string? name = null,
         [Description("Control type filter")] string? controlType = null,
-        [Description("Timeout in milliseconds (default 10000)")] int timeoutMs = 10000)
+        [Description("Timeout in milliseconds (default 10000)")] int timeoutMs = 10000,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.WaitForElement(appId, automationId, name, controlType, timeoutMs);
+        return _auto.WaitForElement(appId, automationId, name, controlType, timeoutMs, container, visibleOnly);
     }
 
     // ── Screenshot ───────────────────────────────────────────────────
@@ -235,6 +244,21 @@ public sealed class WinAppTools
         [Description("Full file path to save the screenshot (e.g. C:\\temp\\screenshot.png)")] string outputPath)
     {
         return _auto.TakeScreenshot(appId, outputPath);
+    }
+
+    [McpServerTool, Description("Take a screenshot of one UI element (the window capture cropped to the element's bounds) and save it to a file. Use it to show a model one widget, e.g. a chart, instead of the whole window.")]
+    public static string take_element_screenshot(
+        [Description("App ID")] string appId,
+        [Description("Full file path to save the screenshot (PNG)")] string outputPath,
+        [Description("AutomationId of the element")] string? automationId = null,
+        [Description("Name/text of the element")] string? name = null,
+        [Description("Control type filter")] string? controlType = null,
+        [Description("0-based index when multiple elements match (-1 = first match)")] int index = -1,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false,
+        [Description("Pixels of margin around the element (default 4)")] int margin = 4)
+    {
+        return _auto.TakeElementScreenshot(appId, outputPath, automationId, name, controlType, index, container, visibleOnly, margin);
     }
 
     // ── Batch & Filtered Operations ──────────────────────────────────
@@ -294,9 +318,11 @@ public sealed class WinAppTools
         [Description("AutomationId of the element")] string? automationId = null,
         [Description("Name/text of the element")] string? name = null,
         [Description("Control type filter")] string? controlType = null,
-        [Description("0-based index when multiple elements match (-1 = first match)")] int index = -1)
+        [Description("0-based index when multiple elements match (-1 = first match)")] int index = -1,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.GetElementBounds(appId, automationId, name, controlType, index);
+        return _auto.GetElementBounds(appId, automationId, name, controlType, index, container, visibleOnly);
     }
 
     [McpServerTool, Description("Quick boolean check if a UI element exists. Returns 'true' or 'false'. Much faster than read_element when you only need existence.")]
@@ -304,9 +330,11 @@ public sealed class WinAppTools
         [Description("App ID")] string appId,
         [Description("AutomationId of the element")] string? automationId = null,
         [Description("Name/text of the element")] string? name = null,
-        [Description("Control type filter")] string? controlType = null)
+        [Description("Control type filter")] string? controlType = null,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.ElementExists(appId, automationId, name, controlType);
+        return _auto.ElementExists(appId, automationId, name, controlType, container, visibleOnly);
     }
 
     [McpServerTool, Description("Wait until a UI element's property reaches a specific value. Properties: name, isEnabled, isOffscreen, text/value, isChecked, selectedItem.")]
@@ -466,9 +494,10 @@ public sealed class WinAppTools
         [Description("Name of the element")] string? name = null,
         [Description("Control type filter")] string? controlType = null,
         [Description("0-based index when multiple match (-1 = first)")] int index = -1,
-        [Description("Optional HWND (0 = main window)")] long windowHandle = 0)
+        [Description("Optional HWND (0 = main window)")] long windowHandle = 0,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null)
     {
-        return _auto.ScrollIntoView(appId, automationId, name, controlType, index, windowHandle);
+        return _auto.ScrollIntoView(appId, automationId, name, controlType, index, windowHandle, container);
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -545,9 +574,11 @@ public sealed class WinAppTools
         [Description("Name of the grid/table")] string? name = null,
         [Description("Control type (DataGrid, Table, List — default DataGrid)")] string? controlType = null,
         [Description("0-based index when multiple grids match (-1 = first)")] int index = -1,
-        [Description("Optional HWND (0 = main window)")] long windowHandle = 0)
+        [Description("Optional HWND (0 = main window)")] long windowHandle = 0,
+        [Description("AutomationId of an ancestor to search under (e.g. a tree or panel), so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen (not offscreen, non-empty bounds); also applies to the container")] bool visibleOnly = false)
     {
-        return _auto.GetGridItem(appId, row, column, automationId, name, controlType, index, windowHandle);
+        return _auto.GetGridItem(appId, row, column, automationId, name, controlType, index, windowHandle, container, visibleOnly);
     }
 
     // ══════════════════════════════════════════════════════════════════
