@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
 using FlaUI.Core.Conditions;
@@ -19,6 +20,7 @@ namespace WinAppMCP;
 public sealed class WinAppAutomation : IDisposable
 {
     private readonly UIA3Automation _automation = new();
+    private readonly string _uiaTimeoutStatus;
     private readonly Dictionary<string, Application> _apps = new();
     private readonly Dictionary<string, Window> _windowCache = new();
     private readonly Dictionary<string, DateTime> _windowCacheTime = new();
@@ -29,6 +31,39 @@ public sealed class WinAppAutomation : IDisposable
     private readonly Dictionary<string, AutomationElement[]> _descendantCache = new();
     private readonly Dictionary<string, DateTime> _descendantCacheTime = new();
     private static readonly TimeSpan DescendantCacheTTL = TimeSpan.FromSeconds(2);
+
+    public WinAppAutomation()
+    {
+        _uiaTimeoutStatus = ApplyUiaTimeout();
+    }
+
+    /// Lets a slow app stay slow instead of failing with 0x80131505. A long timeout also makes a mistake wait
+    /// longer: an invoke_element that opens a modal dialog blocks until this timeout ends.
+    /// A bad value keeps the defaults and shows in check_session_status, because the tool class has no way to fail at startup.
+    private string ApplyUiaTimeout()
+    {
+        string? raw = Environment.GetEnvironmentVariable(UiaTimeout.VariableName);
+        bool valid = UiaTimeout.TryParse(raw, out int seconds, out string? error);
+        if (valid)
+        {
+            try
+            {
+                _automation.TransactionTimeout = TimeSpan.FromSeconds(seconds);
+                _automation.ConnectionTimeout = TimeSpan.FromSeconds(seconds);
+            }
+            catch (Exception ex)
+            {
+                error = $"{UiaTimeout.VariableName}={seconds} not applied: {ex.Message}";
+            }
+        }
+
+        if (error is not null)
+        {
+            Console.Error.WriteLine(error);
+            return $"defaults ({error})";
+        }
+        return valid ? $"transaction and connection {seconds} s" : "defaults";
+    }
 
     /// <summary>
     /// Returns cached descendants if still valid, otherwise fetches fresh.
@@ -1092,17 +1127,109 @@ public sealed class WinAppAutomation : IDisposable
             if (bmp is null)
                 return "ERROR: Failed to capture window.";
 
-            Rectangle crop = new(elRect.X - winRect.X - margin, elRect.Y - winRect.Y - margin, elRect.Width + 2 * margin, elRect.Height + 2 * margin);
-            crop.Intersect(new Rectangle(0, 0, bmp.Width, bmp.Height));
-            if (crop.Width <= 0 || crop.Height <= 0)
+            Rectangle? crop = OcrGeometry.CropForElement(elRect, winRect, margin, bmp.Size);
+            if (crop is null)
                 return "ERROR: Element is outside the window capture";
 
-            using Bitmap part = bmp.Clone(crop, bmp.PixelFormat);
+            using Bitmap part = bmp.Clone(crop.Value, bmp.PixelFormat);
             string? dir = Path.GetDirectoryName(outputPath);
             if (!string.IsNullOrEmpty(dir))
                 Directory.CreateDirectory(dir);
             part.Save(outputPath, ImageFormat.Png);
             return $"Element screenshot saved to {outputPath} ({part.Width}x{part.Height})";
+        }
+        catch (Exception ex)
+        {
+            return $"ERROR: {ex.Message}";
+        }
+    }
+
+    // ── OCR ──────────────────────────────────────────────────────────
+
+    /// Reads text from the pixels of the window, or of one element. It never clicks or types.
+    /// With no selector the only UIA use is finding the window, so it is safe on pages where tree queries are not.
+    public string ReadTextOcr(string appId, string? automationId = null, string? name = null, string? controlType = null,
+        int index = -1, string? container = null, bool visibleOnly = false, int margin = 4,
+        string language = "en-US", int scale = 2, string? outputPath = null)
+    {
+        if (scale < 1 || scale > 4)
+            return $"ERROR: scale must be from 1 to 4, got {scale}";
+
+        try
+        {
+            string? languageError = WindowsOcr.LanguageError(language);
+            if (languageError is not null)
+                return $"ERROR: {languageError}";
+
+            Window? win = GetMainWindow(appId);
+            if (win is null)
+                return $"ERROR: Cannot get main window for '{appId}'";
+
+            bool wholeWindow = string.IsNullOrEmpty(automationId) && string.IsNullOrEmpty(name)
+                && string.IsNullOrEmpty(controlType) && string.IsNullOrEmpty(container);
+            Rectangle? elementRect = null;
+            if (!wholeWindow)
+            {
+                AutomationElement? el = ResolveElement(appId, automationId, name, controlType, index, container, visibleOnly);
+                if (el is null)
+                    return $"ERROR: Element not found (automationId={automationId}, name={name}, container={container})";
+                elementRect = el.BoundingRectangle;
+                if (elementRect.Value.Width <= 0 || elementRect.Value.Height <= 0)
+                    return "ERROR: Element has empty bounds (off-screen or hidden)";
+            }
+
+            EnsureTreeAvailable(win); // A capture of a minimized window can be blank or old.
+            Rectangle winRect = win.BoundingRectangle;
+            IntPtr hwnd = GetNativeHandle(win);
+            bool foreground = hwnd != IntPtr.Zero && GetForegroundWindow() == hwnd;
+            bool locked = IsDesktopLocked();
+
+            using Bitmap? bmp = CaptureWindowBitmap(win);
+            if (bmp is null)
+                return "ERROR: Failed to capture window.";
+
+            Rectangle crop = new(Point.Empty, bmp.Size);
+            if (elementRect is not null)
+            {
+                Rectangle? part = OcrGeometry.CropForElement(elementRect.Value, winRect, margin, bmp.Size);
+                if (part is null)
+                    return "ERROR: Element is outside the window capture";
+                crop = part.Value;
+            }
+
+            using Bitmap image = bmp.Clone(crop, bmp.PixelFormat);
+            int effectiveScale = OcrGeometry.EffectiveScale(image.Width, image.Height, scale, WindowsOcr.MaxImageDimension);
+            if (effectiveScale == 0)
+                return $"ERROR: Image {image.Width}x{image.Height} is larger than the OCR limit of {WindowsOcr.MaxImageDimension} pixels";
+
+            if (!string.IsNullOrEmpty(outputPath))
+            {
+                string? dir = Path.GetDirectoryName(outputPath);
+                if (!string.IsNullOrEmpty(dir))
+                    Directory.CreateDirectory(dir);
+                image.Save(outputPath, ImageFormat.Png);
+            }
+
+            IReadOnlyList<OcrLineResult> lines = WindowsOcr.Recognize(image, language, effectiveScale);
+            Point origin = new(winRect.X + crop.X, winRect.Y + crop.Y);
+            return JsonSerializer.Serialize(new
+            {
+                engine = "Windows.Media.Ocr",
+                language,
+                scale = effectiveScale,
+                source = wholeWindow ? "window" : "element",
+                windowInForeground = foreground,
+                sessionLocked = locked,
+                image = new { width = image.Width, height = image.Height, path = outputPath },
+                text = string.Join("\n", lines.Select(l => l.Text)),
+                lines = lines.Select(line =>
+                {
+                    var words = line.Words
+                        .Select(w => new { text = w.Text, box = OcrGeometry.ToScreen(w.X, w.Y, w.Width, w.Height, effectiveScale, origin) })
+                        .ToList();
+                    return new { text = line.Text, box = OcrGeometry.Union(words.Select(w => w.box).ToList()), words };
+                }),
+            });
         }
         catch (Exception ex)
         {
@@ -2830,6 +2957,9 @@ public sealed class WinAppAutomation : IDisposable
     private static extern bool PrintWindow(IntPtr hwnd, IntPtr hdcBlt, uint nFlags);
 
     [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool GetWindowRect(IntPtr hWnd, out WRECT lpRect);
 
@@ -3105,6 +3235,7 @@ public sealed class WinAppAutomation : IDisposable
         StringBuilder sb = new();
         bool isLocked = IsDesktopLocked();
         sb.AppendLine($"SessionLocked: {isLocked}");
+        sb.AppendLine($"UiaTimeouts: {_uiaTimeoutStatus}");
 
         if (isLocked)
         {

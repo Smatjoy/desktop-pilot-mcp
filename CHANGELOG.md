@@ -17,6 +17,8 @@ Fixes found while driving a WinForms + DevExpress app (Ekip Connect 3) as an una
 - `WINAPP_NAME_MATCH=exact` environment variable: name filters match exactly (case-insensitive) instead of "equals or contains", so "Settings A" no longer matches "Other Settings A".
 - `container` (AutomationId of an ancestor) and `visibleOnly` (on-screen elements only) on `find_all_elements`, `click_element`, `read_element`, `element_exists`, `wait_for_element`, `get_element_bounds`, `get_grid_item` and (`container`) `scroll_into_view`; `index` on `read_element`.
 - `take_element_screenshot`: the window capture cropped to one element's bounds (works on multi-monitor setups with negative coordinates).
+- `WINAPP_UIA_TIMEOUT_S` environment variable: sets the UIA transaction and connection timeouts, in whole seconds from 1 to 3600. Not set means the defaults. A slow app then stays slow instead of failing with `0x80131505`. `check_session_status` shows the value in use, or why a bad value was ignored. An `invoke_element` that opens a modal dialog waits this long before it fails, so a long timeout makes that mistake slower.
+- `read_text_ocr`: reads text from the pixels of the window or of one element, with Windows' own OCR. It is read-only and nothing leaves the PC. It returns the text, plus each line and word with screen boxes. It needs an OCR language pack; a missing one gives `OCR_LANGUAGE_NOT_AVAILABLE` and the list of installed languages. Windows OCR has no confidence score. Reading the whole window also reads anything shown there, including a signed-in account name.
 
 ## [2.0.0] — 2026-03-28
 

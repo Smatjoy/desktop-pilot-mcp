@@ -261,6 +261,23 @@ public sealed class WinAppTools
         return _auto.TakeElementScreenshot(appId, outputPath, automationId, name, controlType, index, container, visibleOnly, margin);
     }
 
+    [McpServerTool, Description("Read text from the pixels of the app window, or of one element, with local Windows OCR. Read-only: it never clicks or types, and nothing leaves the PC. Use when text is not in the UIA tree. Returns JSON with the text, each line and word, and screen boxes. There is no confidence score, and misreads such as 0/O or 1/l are possible. With no selector it reads the whole window and queries no UI tree, so use that on pages where tree queries are unsafe. Check windowInForeground: a normal capture shows whatever is on top of the window.")]
+    public static string read_text_ocr(
+        [Description("App ID")] string appId,
+        [Description("AutomationId of the element to read (omit all selectors to read the whole window)")] string? automationId = null,
+        [Description("Name/text of the element")] string? name = null,
+        [Description("Control type filter")] string? controlType = null,
+        [Description("0-based index when multiple elements match (-1 = first match)")] int index = -1,
+        [Description("AutomationId of an ancestor to search under, so equal names elsewhere do not match")] string? container = null,
+        [Description("Only elements that are on screen; also applies to the container")] bool visibleOnly = false,
+        [Description("Pixels of margin around the element (default 4)")] int margin = 4,
+        [Description("OCR language tag, default en-US. An error lists the languages installed on this PC")] string language = "en-US",
+        [Description("Enlarge the image 1 to 4 times before OCR (default 2). Small text reads better when enlarged")] int scale = 2,
+        [Description("Optional full path to save the image that was read (PNG), before enlarging, as evidence")] string? outputPath = null)
+    {
+        return _auto.ReadTextOcr(appId, automationId, name, controlType, index, container, visibleOnly, margin, language, scale, outputPath);
+    }
+
     // ── Batch & Filtered Operations ──────────────────────────────────
 
     [McpServerTool, Description("Fill multiple form fields at once in a single call. Much faster than calling type_text multiple times. Fields are matched by AutomationId or Name.")]
